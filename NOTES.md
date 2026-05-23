@@ -3,30 +3,179 @@
 **Dataset:** FDA Adverse Event Reporting System (FAERS), Quarterly Data Extract  
 **Quarter analysed:** 2026 Q1  
 **Source:** https://fis.fda.gov/extensions/FPD-QDE-FAERS/FPD-QDE-FAERS.html  
-**File explored first:** `DEMO26Q1.txt` (demographics, one row per case version)  
-**Rows:** 397,224  
-**Columns:** 25  
+**File explored:** `DEMO26Q1.txt` — demographics, one row per case version  
+**Shape:** 397,224 rows × 25 columns  
 **Encoding:** latin-1 (not UTF-8)  
-**Delimiter:** `$`
+**Delimiter:** `$`  
+**Read strategy:** all columns as strings (`dtype=str`); type coercion is the validator's job, not pandas'.
 
 ---
 
-## Data quality issues found
+## Confirmed from spec
 
-Each issue: what it is, where I saw it, example, and what I plan to do about it.
+- Delimiter `$`, encoding latin-1
+- `primaryid` is unique per row (every value count = 1)
+- `caseid` is unique per row *within this quarter*, but the spec states a `caseid` can have multiple `caseversion` values across quarters. Distribution of `caseversion` confirms follow-ups arriving alongside initial reports: 67% v1, 20% v2, 6% v3, dropping to a long tail past v10.
+- Partial dates exist (see issue #3)
+- Age unit varies by `age_cod` (see issue #5)
+- `sex` is a coded value (M/F/null). Note: the spec mentions "UNK" and "NS" codes — these do not appear in 2026 Q1; FAERS modernisation appears to have collapsed them into null.
 
-### 1. Mixed types in `to_mfr` column
-- **Observed:** pandas raised DtypeWarning on read. `to_mfr` is documented as Y/N but contains other values.
-- **Example values:** `Y` (208,431 rows), `N` (188,001 rows), blank (783 rows), `<some unexpected value if you found one>` (N rows)
-- **Decision:** read all columns as strings on ingest; validate `to_mfr` as enum {Y, N, null} in Pydantic; reject anything else to the rejected_rows table.
+---
 
-### 2. Partial dates in date fields
-- **Observed:** `event_dt`, `init_fda_dt`, `fda_dt`, `mfr_dt`, `rept_dt` are stored as integer-shaped strings of length 4, 6, or 8.
-- **Example values:** `20240315` (full), `202403` (year-month only), `2024` (year only).
-- **Source confirms this is intentional:** README section C — FDA preserves the granularity submitted in each case rather than fabricating missing day/month.
-- **Decision:** model as a custom `PartialDate` type in Pydantic; store as string in DB plus a separate `event_dt_precision` column (`day` / `month` / `year`) so downstream queries can filter on precision.
+## Data quality issues
 
-### 3. Age values with unit-dependent magnitudes
-- **Observed:** `age` ranges from 0 to <max you saw>. `age_cod` indicates unit.
-- **Example:** row X has `age=10950, age_cod=DY` which is 30 years in days; row Y has `age=85, age_cod=YR`.
-- **Decision:** normalise to years on ingest; store both raw `(age, age_cod)` and a derived `age_years` float. Flag `age_years > 120` as suspicious but not rejected (FDA may genuinely have implausible values).
+### 1. `to_mfr` is 97% null
+- **Counts:** NaN 384,965 (96.9%) · N 10,891 (2.7%) · Y 1,368 (0.3%)
+- **Spec says:** Y/N flag for whether the case was forwarded to the manufacturer.
+- **Ambiguity:** NaN could mean "no, not forwarded" or "unknown / not captured." The data alone can't distinguish.
+- **Pandas dtype warning explained:** chunked type inference — early chunks were all NaN (inferred float), later chunks contained "Y"/"N" strings, forcing a widen. A chunking artifact, not a real data issue.
+- **Decision:** validate as `Optional[Literal["Y","N"]]`; preserve null as null. Do not coerce missing → "N".
+
+### 2. `i_f_code` cleanly splits initial vs follow-up
+- **Counts:** I 267,307 (67.3%) · F 129,917 (32.7%) · no nulls, no surprises
+- **Decision:** validate as `Literal["I","F"]`, required.
+
+### 3. Partial dates are real and pervasive
+- **Observed:** date fields stored as integer-shaped strings of length 4, 6, or 8.
+- **Example values:** `20260112` (day), `202602` (month), `2026` (year). Top values in `event_dt` include many `YYYY0101` and `YYYYMM01` patterns.
+- **Spec confirms** (README section C): FDA preserves submitted granularity; partial dates are intentional.
+- **Decision:** model dates as a `PartialDate` type — original string plus a `precision` enum (`day`/`month`/`year`). Do not coerce to `datetime.date` on ingest; downstream analytics can decide how to handle precision.
+
+### 4. `event_dt` is 58% null
+- **Counts:** 229,258 of 397,224 rows (57.7%) have no event date.
+- **Spec says:** "Case Event Date, when available" — null is allowed.
+- **Decision:** nullable; not a rejection condition. Worth surfacing in any per-quarter completeness report.
+
+### 5. Age requires unit normalisation
+- **`age_cod` counts:** YR 240,261 · NaN 151,605 · DEC 3,850 · MON 1,102 · DY 265 · WK 126 · HR 15
+- **Spec confirms:** "a 30-year (YR) old will be displayed as a 10,950-day (DY) old" — manufacturers may submit any unit.
+- **Inconsistency found:** `age` has 151,608 nulls, `age_cod` has 151,605 nulls — **3 rows have `age_cod` populated but `age` missing.** A unit without a value.
+- **Decision:** normalise to `age_years` (float) using `{YR:1, MON:1/12, WK:1/52, DY:1/365.25, HR:1/8766, DEC:10}`. Store raw `(age, age_cod)` alongside derived `age_years` for traceability. Validation rule: if either is non-null, both must be non-null.
+
+### 6. Weight is 83% null and unit-coded
+- **`wt_cod` counts:** NaN 328,133 · KG 69,039 · LBS 52
+- **Pattern:** weights in pounds are vanishingly rare (~0.08% of populated weights).
+- **Decision:** normalise to `weight_kg` using `{KG:1, LBS:0.453592}`. Same both-or-neither rule as age.
+
+### 7. `sex` is 19% null and has no UNK/NS values
+- **Counts:** F 198,072 (49.9%) · M 123,719 (31.2%) · NaN 75,433 (19%) — no UNK, no NS
+- **Spec discrepancy:** spec lists UNK and NS as valid values. The 2026 Q1 data uses null instead.
+- **Decision:** `Optional[Literal["F","M"]]`. Reject any other non-null value to `rejected_rows` with reason `unexpected_sex_code`.
+
+### 8. `reporter_country` contains a non-ISO sentinel
+- **Observed:** "COUNTRY NOT SPECIFIED" appears 4,012 times alongside 2-letter ISO codes (US, EU, CA, GB, JP…).
+- **Side note:** "EU" isn't a country either — it's used as an aggregate code (40,633 rows).
+- **Decision:** validate against the set of ISO 3166 2-letter codes ∪ `{EU}`. Coerce on ingest, log the count for the run report.
+
+### 9. `occr_country` has true nulls but `reporter_country` does not
+- **Observation:** `reporter_country` has 0 nulls; `occr_country` has 32,166 nulls (8.1%).
+- **Implication:** the submitter's country is always known (likely a required submission field), but the country where the event *occurred* often isn't.
+- **Decision:** `reporter_country` required, `occr_country` nullable. Useful asymmetry to document — it reveals something about the data-generating process.
+
+### 10. Heavy heaping on first-of-month/year in event dates
+- **Top values in `event_dt`:** `20250101` (15,599), `20260101` (10,176), `20251201` (5,933), `20240101` (4,851), `20260201` (4,205) …
+- **Suspicious pattern:** dates ending in `0101` and `MM01` are over-represented for what should be a roughly uniform distribution of real-world events.
+- **Spec contradiction:** the README states FDA *no longer* imputes — partial dates should be preserved as partial. So why are full 8-digit dates clustering on `01` days? Possibilities: (a) submitters self-impute before transmitting; (b) legacy migration imputed missing components; (c) FDA documentation lags actual processing.
+- **Decision:** flag rows where `event_dt` matches `YYYY0101` or `YYYYMM01` with a boolean `event_dt_suspect_imputed`. Do not reject — annotate. Downstream analyses involving event timing should be aware.
+
+---
+
+## Sparse columns
+
+Mostly null by design rather than by error. Listed for schema clarity:
+
+| Column | Null % | Treatment |
+|---|---|---|
+| `to_mfr` | 96.9% | nullable enum |
+| `lit_ref` | 93.8% | nullable, free text (see issue #11) |
+| `auth_num` | 90.3% | nullable, free text |
+| `wt`, `wt_cod` | 82.6% | nullable, both-or-neither |
+| `age_grp` | 66.8% | nullable enum |
+| `occp_cod` | 35.1% | nullable enum |
+| `mfr_num` | 3.4% | nullable, free text |
+
+### 11. `lit_ref` is uncontrolled free text with massive within-citation duplication
+- **Observed:** 24,819 non-null rows. The top 10 most common values are all variants of *the same citation* (the 2024 NPDS annual report). One paper, ten different spellings differing in punctuation, "America^s" vs "America?s", "42nd Annual report" vs "42nd annual report", with and without DOI.
+- **Significance:** textbook example of why uncontrolled free-text reference fields fail. Persistent identifiers (DOIs) and controlled vocabularies would collapse these to a single record. This is the kind of data-quality problem FAIR principles directly address.
+- **Treatment:** ingest as raw string; do not attempt deduplication at ingest. Document as a candidate for downstream enrichment via CrossRef DOI matching.
+
+---
+
+## Things expected from the spec but not observed
+
+- No `UNK` / `NS` codes in `sex` — only null
+- No `GNDR_COD` column — confirmed renamed to `sex`
+- No `age_cod` values outside the documented enum
+- No `i_f_code` or `rept_cod` values outside the documented enums
+- No malformed rows reported by `on_bad_lines="warn"` — all 397,224 rows parsed structurally clean
+
+## Open questions
+
+- Schema drift across quarterly files — load an older quarter (e.g. 2014 Q3) and diff columns
+- The 3 rows with `age_cod` populated but `age` missing — pull them, examine
+- Is `EU` used consistently in `reporter_country` (EMA submissions)?
+- The four date fields `mfr_dt`, `init_fda_dt`, `fda_dt`, `rept_dt` — spec is hazy on their distinctions; which (if any) should the validator treat as required?
+
+---
+
+## Read settings used
+
+```python
+demo = pd.read_csv(
+    DATA / "DEMO26Q1.txt",
+    sep="$",
+    encoding="latin-1",
+    dtype=str,
+    keep_default_na=False,
+    na_values=[""],
+    on_bad_lines="warn",
+)
+```
+
+### 12. Numeric outliers in `age` and `wt` reveal upstream coding errors, not random noise
+
+Both columns parse without error (no unparseable strings) but contain biologically implausible values. The pattern of the outliers is more interesting than the count.
+
+**Age — 4 implausible rows out of 245,616 populated (0.0016%).**
+
+| primaryid | age | age_cod | age_grp | normalised years |
+|---|---|---|---|---|
+| 262740041 | 23 | DEC | A (Adult) | 230 |
+| 244150… | 126 | YR | — | 126 |
+| 265065331 | 40 | DEC | (null) | 400 |
+| 265083411 | 70 | DEC | (null) | 700 |
+
+Three of four implausibles use `age_cod = DEC` with values that would be perfectly normal as `YR`. Row `262740041` is internally contradictory: `age=23, age_cod=DEC` normalises to 230 years, yet `age_grp=A` (Adult, ~18–64). Within a single row, the submitter has told us they intended a 23-year-old adult and coded the unit as decades. This confirms the `DEC↔YR` miscoding hypothesis for at least this row; the two other DEC outliers have null `age_grp` so the hypothesis is consistent but not directly confirmed.
+
+The fourth row (`126 YR`) is more likely a digit-transposition error (intended 26 or 76).
+
+This is also a worked example of why **cross-field validation matters**: each field individually passes a single-column check (`age` is a valid integer, `age_cod` is a valid enum, `age_grp` is a valid enum), but the combination is impossible. Single-column validators cannot detect this class of error.
+
+**Weight — 5 rows over 500 kg, plus a tail of suspiciously small values.**
+
+| primaryid | wt | wt_cod | plausible intended value |
+|---|---|---|---|
+| 248762252 | 551.15 | KG | possibly real |
+| 263128201 | 4,105 | KG | probably 41.05 (lost decimal) |
+| 263822571 | 80,505 | KG | probably 80.505 kg, or 80,505 g coded as KG |
+| 263827301 | 26,775 | KG | probably 26.775 or 267.75 |
+| 265001761 | 849 | KG | borderline; could be real |
+
+Two distinct patterns visible: dropped decimal separators, and possible gram-vs-kilogram confusion. Without round-tripping to the source we can't recover the intended values reliably.
+
+Sub-1kg weights: 64 rows. Likely "unknown coded as 0", but some could legitimately be neonatal — worth cross-checking against `age_grp = N` before assuming.
+
+**Lesson:** parseability is not validity. A column can be 100% numeric and still contain semantic garbage. More importantly, outliers often cluster around a specific upstream error mode (here: unit miscoding, lost decimals) rather than being random noise. Examining outliers *qualitatively* yields more information than counting them.
+
+**Decision:** introduce single-field range checks, cross-field consistency checks, and graded severity.
+
+- `age_years` (derived from `age` × `age_cod`):
+  - Reject if >150 (reason: `age_implausible`)
+  - Warn if >120
+- `(age, age_cod, age_grp)` cross-field check:
+  - If `age_grp` is non-null, the normalised `age_years` must fall within the band for that group (N: <1mo, I: 1mo–2yr, C: 2–12, T: 13–17, A: 18–64, E: ≥65). Mismatches go to `rejected_rows` with reason `age_group_inconsistent`. This catches the `DEC` miscoding pattern.
+- `weight_kg`:
+  - Reject if >1000 or <0 (reason: `weight_implausible`)
+  - Warn if >500 (possible gram/kg confusion) or <1 (possible neonate or "unknown as zero")
+
+Soft warnings preserve the record with an annotation; hard rejections only catch the unsalvageable.
