@@ -167,15 +167,55 @@ Sub-1kg weights: 64 rows. Likely "unknown coded as 0", but some could legitimate
 
 **Lesson:** parseability is not validity. A column can be 100% numeric and still contain semantic garbage. More importantly, outliers often cluster around a specific upstream error mode (here: unit miscoding, lost decimals) rather than being random noise. Examining outliers *qualitatively* yields more information than counting them.
 
-**Decision:** introduce single-field range checks, cross-field consistency checks, and graded severity.
 
-- `age_years` (derived from `age` × `age_cod`):
+**Decision:** graded severity for age validation.
+
+- `age_years` single-field check:
   - Reject if >150 (reason: `age_implausible`)
-  - Warn if >120
-- `(age, age_cod, age_grp)` cross-field check:
-  - If `age_grp` is non-null, the normalised `age_years` must fall within the band for that group (N: <1mo, I: 1mo–2yr, C: 2–12, T: 13–17, A: 18–64, E: ≥65). Mismatches go to `rejected_rows` with reason `age_group_inconsistent`. This catches the `DEC` miscoding pattern.
-- `weight_kg`:
-  - Reject if >1000 or <0 (reason: `weight_implausible`)
-  - Warn if >500 (possible gram/kg confusion) or <1 (possible neonate or "unknown as zero")
+- `(age_years, age_grp)` cross-field check, with two thresholds:
+  - **Strict band** (per spec definition): N <1mo, I 1mo–2yr, C 2–12, T 13–17, A 18–64, E ≥65
+  - **Implausible band** (wider tolerance for typo/interpretation): N <1yr, I <5yr, C <18yr, T 5–25, A 10–80, E ≥40
+  - Outside implausible band → reject (`age_group_inconsistent`). Catches DEC↔YR miscoding.
+  - Outside strict but inside implausible → annotate `age_group_boundary_mismatch = True`. Preserves the row for downstream consumers who care.
+- Rationale: a 12-year-old declared "Adolescent" is a definition disagreement, not a data error. A 230-year-old declared "Adult" is a data error. The two-tier design treats them differently.
+
+`weight_kg`:
+- Reject if >1000 or <0 (reason: `weight_implausible`)
 
 Soft warnings preserve the record with an annotation; hard rejections only catch the unsalvageable.
+
+**Process lesson:** the first pass of the validator over the real data found 654 rejections, 100% from this rule, which surfaced the boundary-vs-miscoding distinction. The model is calibrated against the data, not against the spec alone.
+
+**End-to-end validation against 2026 Q1 (397,224 rows):**
+
+- 45 rows rejected (0.011%)
+- Rejection categories:
+  - `weight_kg == 0` sentinel — most of the 45
+  - `age_grp` Adult overflow (age 81–99 with age_grp=A): 5 rows
+  - `age_grp` Elderly underflow (age <65 with age_grp=E): 2 rows
+  - `age` populated without `age_cod` (or vice versa): the inconsistency originally flagged at exploration
+- Soft annotations on valid rows:
+  - `age_group_boundary_mismatch`: <FILL IN from your annotation counter>
+  - `event_dt_suspect_imputed`: <FILL IN>
+
+**Tuning decision:** the 7 Adult/Elderly boundary rejections were considered for relaxation (widening the implausible bands). Rejected: 7 rows in 397k is below the noise floor, and loosening the band would weaken the catastrophic-mismatch catch that motivates the rule (the DEC↔YR miscoding produces values orders of magnitude outside the band, not 5 years outside). The bounds remain spec-aligned with a generous tolerance; rare submitter convention disagreements are correctly routed to the rejection table for review rather than silently passed.
+
+These numbers calibrate the validator against the actual data-generating process, not just the spec. A future quarterly ingest producing 10× this rejection rate would indicate either a schema change or an upstream system issue worth investigating.
+
+
+---
+
+## Production ingest results — 2026 Q1
+
+First run: 397,224 rows in 2m 54s (~2,280 rows/sec).
+
+| Outcome | Count |
+|---|---|
+| Clean | 397,179 |
+| `weight_implausible` | 30 |
+| `age_group_inconsistent` | 7 |
+| `age_unit_mismatch` | 5 |
+| `age_implausible` | 3 |
+| **Total rejected** | **45** (0.0113%) |
+
+Reconciliation note: one `age=126, age_cod=YR` row from exploration passed validation because `age_grp` was null (no cross-field check fires) and 126 < 150 (hard reject threshold). It is now in `demo_clean` and would only be detectable by a softer "implausible-but-not-catastrophic" annotation. Documented as a known limitation; not addressed in this iteration.

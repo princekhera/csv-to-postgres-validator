@@ -25,15 +25,16 @@ def get_database_url() -> str:
 def make_engine(url: str | None = None) -> Engine:
     """Create a SQLAlchemy engine.
 
-    `pool_pre_ping=True` adds a cheap connectivity check before each
-    checkout, which avoids stale-connection errors after Postgres restarts.
+    `insertmanyvalues_page_size` controls how many rows are batched into
+    a single multi-row INSERT statement when using `execute(insert(...), [dicts])`.
+    The default is 1000; tuning depends on row size and network latency.
     """
     return create_engine(
         url or get_database_url(),
         pool_pre_ping=True,
         future=True,
+        insertmanyvalues_page_size=1000,
     )
-
 
 # Module-level engine and session factory — created lazily by the CLI.
 # Not instantiated at import time, so tests can substitute their own.
