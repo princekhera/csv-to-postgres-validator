@@ -5,8 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "alembic>=1.18.4",
     "pandas>=3.0.3",
-    "psycopg2-binary>=2.9.12",
+    "psycopg[binary]>=3.3.4",
     "pydantic>=2.13.4",
     "pyyaml>=6.0.3",
     "sqlalchemy[asyncio]>=2.0.49",
@@ -16,8 +17,19 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "ipykernel>=7.2.0",
+    "jupyterlab>=4.5.7",
     "pytest>=9.0.3",
     "pytest-cov>=7.1.0",
     "ruff>=0.15.14",
     "testcontainers>=4.14.2",
 ]
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/faers_validator"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
