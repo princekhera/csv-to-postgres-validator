@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session
 from testcontainers.postgres import PostgresContainer
 
 from faers_validator.db.engine import make_engine

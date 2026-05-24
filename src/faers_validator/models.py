@@ -98,7 +98,7 @@ class DemoRow(BaseModel):
 
     # Geography (issue #8, #9)
     reporter_country: str | None = None  # sentinel "COUNTRY NOT SPECIFIED" coerces to None (issue #8)
-    
+
     occr_country: str | None = None
 
     # Annotations / soft warnings — populated during validation, not from input
@@ -131,7 +131,7 @@ class DemoRow(BaseModel):
     # as a sentinel meaning "unknown reporter country." We coerce that sentinel
     # to None on ingest so downstream consumers see standard SQL NULL semantics
     # for "unknown," rather than a magic string. Documented as issue #8.
-    
+
     # ── Date parsing ─────────────────────────────────────────────────
 
     @field_validator(
@@ -241,5 +241,5 @@ class DemoRow(BaseModel):
         if self.event_dt is not None and self.event_dt.is_first_of_period():
             self.event_dt_suspect_imputed = True
         return self
-    
+
 

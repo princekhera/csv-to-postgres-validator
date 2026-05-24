@@ -10,10 +10,9 @@ from __future__ import annotations
 
 from datetime import date
 from enum import Enum
-from typing import Annotated, Any
+from typing import Any
 
-from pydantic import BaseModel, GetCoreSchemaHandler
-from pydantic_core import CoreSchema, core_schema
+from pydantic import BaseModel
 
 
 class DatePrecision(str, Enum):
@@ -63,7 +62,7 @@ class PartialDate(BaseModel):
         if self.precision != DatePrecision.DAY:
             return False
         return self.day == 1
-    
+
 
 def _validate_partial_date(value: Any) -> PartialDate | None:
     if value is None or value == "":

@@ -10,7 +10,6 @@ from pydantic import ValidationError
 from faers_validator.models import DemoRow
 from faers_validator.partial_date import DatePrecision
 
-
 # ── Reusable fixture for a minimal valid row ─────────────────────────
 
 @pytest.fixture

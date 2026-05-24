@@ -9,9 +9,8 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from ..db.tables import DemoClean
 from ..models import DemoRow
-from ..partial_date import PartialDate, DatePrecision
+from ..partial_date import DatePrecision, PartialDate
 
 
 def _partial_date_to_columns(pd: PartialDate | None) -> tuple[str | None, str | None, object]:

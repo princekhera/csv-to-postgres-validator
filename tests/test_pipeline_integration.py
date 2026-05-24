@@ -147,12 +147,11 @@ def test_dry_run_validates_without_writing(engine, tiny_csv):
     assert result["rows_rejected"] == 4
     assert after_clean == before_clean
     assert after_rej == before_rej
-    assert after_runs == before_runs    
+    assert after_runs == before_runs
 
 def test_double_ingest_without_upsert_fails(clean_db, tiny_csv):
     """Re-ingesting the same file should fail on the primary key constraint
     unless --upsert is given."""
-    import pytest
     from psycopg.errors import UniqueViolation
     from sqlalchemy.exc import IntegrityError
 
@@ -203,4 +202,4 @@ def test_upsert_updates_changed_fields(clean_db, tiny_csv, tmp_path):
 
     assert row.age == 99.0
     assert row.age_grp == "E"
-    assert row.age_years == 99.0    
+    assert row.age_years == 99.0

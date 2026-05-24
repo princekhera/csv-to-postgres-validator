@@ -7,10 +7,8 @@ a list of dicts) which is ~10× faster than ORM add_all for inserts.
 """
 
 from __future__ import annotations
-import json
-from sqlalchemy.engine import Connection
 
-from .transform import DEMO_CLEAN_COLUMNS, DEMO_REJECTED_COLUMNS
+import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -18,17 +16,14 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import insert
-
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session
 
-from ..db.tables import DemoClean, DemoRejected, IngestRun
+from ..db.tables import IngestRun
 from ..models import DemoRow
 from .errors import summarise
 from .reader import iter_demo_records
-from .transform import to_demo_clean_dict
+from .transform import DEMO_CLEAN_COLUMNS, DEMO_REJECTED_COLUMNS, to_demo_clean_dict
 
 log = logging.getLogger(__name__)
 
@@ -220,7 +215,7 @@ def _copy_and_upsert_demo_clean(raw_conn, rows: list[dict]) -> None:
             SELECT {col_list} FROM _stage_demo_clean
             ON CONFLICT (primaryid) DO UPDATE SET {set_clause}
         """)
-        
+
 def _copy_rows(
     raw_conn,
     table: str,
@@ -289,4 +284,4 @@ def _dry_run_ingest(csv_path: Path) -> dict[str, Any]:
         "dry_run": True,
         "rejection_reasons": dict(rejection_reasons),
         "annotations": dict(annotation_counts),
-    }                
+    }
