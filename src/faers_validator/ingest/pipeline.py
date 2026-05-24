@@ -41,8 +41,14 @@ def ingest_demo_file(
     quarter: str,
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    dry_run: bool = False,
+    upsert: bool = False,
 ) -> dict[str, Any]:
     """Ingest one FAERS DEMO file into Postgres."""
+    if dry_run:
+        return _dry_run_ingest(csv_path)
+
+     # Create the ingest_run record first so every clean/rejected row can reference it.
     with Session(engine) as session:
         run = IngestRun(
             source_file=str(csv_path),
@@ -54,6 +60,7 @@ def ingest_demo_file(
         session.refresh(run)
         run_id = run.id
         log.info(f"Started ingest run {run_id} for {csv_path}")
+
 
     rows_seen = 0
     rows_clean = 0
@@ -104,13 +111,13 @@ def ingest_demo_file(
 
                 if len(clean_batch) >= batch_size:
                     t0 = time.perf_counter()
-                    _flush(session, clean_batch, rejected_batch)
+                    _flush(session, clean_batch, rejected_batch, upsert=upsert)
                     t_flush += time.perf_counter() - t0
                     clean_batch, rejected_batch = [], []
 
             if clean_batch or rejected_batch:
                 t0 = time.perf_counter()
-                _flush(session, clean_batch, rejected_batch)
+                _flush(session, clean_batch, rejected_batch, upsert=upsert)
                 t_flush += time.perf_counter() - t0
 
     except Exception as e:
@@ -152,24 +159,68 @@ def ingest_demo_file(
     }
 
 
-def _flush(session: Session, clean_batch: list[dict], rejected_batch: list[dict]) -> None:
+def _flush(
+    session: Session,
+    clean_batch: list[dict],
+    rejected_batch: list[dict],
+    *,
+    upsert: bool = False,
+) -> None:
     """Bulk-load using Postgres COPY.
 
-    COPY streams binary-encoded rows down a single connection and is
-    the fastest way to load bulk data into Postgres. Roughly 10-100×
-    faster than INSERT, depending on row size.
+    If `upsert=True`, clean rows go through a staging table and use
+    INSERT ... ON CONFLICT (primaryid) DO UPDATE to replace existing rows.
+    Rejected rows are always append-only (no upsert).
     """
     conn: Connection = session.connection()
-    raw_conn = conn.connection.dbapi_connection  # the underlying psycopg connection
+    raw_conn = conn.connection.dbapi_connection
 
     if clean_batch:
-        _copy_rows(raw_conn, "faers.demo_clean", DEMO_CLEAN_COLUMNS, clean_batch)
+        if upsert:
+            _copy_and_upsert_demo_clean(raw_conn, clean_batch)
+        else:
+            _copy_rows(raw_conn, "faers.demo_clean", DEMO_CLEAN_COLUMNS, clean_batch)
+
     if rejected_batch:
-        _copy_rows(raw_conn, "faers.demo_rejected", DEMO_REJECTED_COLUMNS, rejected_batch,
-                   json_columns={"raw_data", "errors"})
+        _copy_rows(
+            raw_conn, "faers.demo_rejected", DEMO_REJECTED_COLUMNS, rejected_batch,
+            json_columns={"raw_data", "errors"},
+        )
     session.commit()
 
 
+def _copy_and_upsert_demo_clean(raw_conn, rows: list[dict]) -> None:
+    """COPY into a temp staging table, then UPSERT into demo_clean.
+
+    The staging table is created with the same column shape as demo_clean
+    but without the primary key constraint, so we can write duplicates into
+    it freely. The INSERT ... ON CONFLICT then merges them into the real
+    table in one statement.
+    """
+    col_list = ", ".join(DEMO_CLEAN_COLUMNS)
+    update_cols = [c for c in DEMO_CLEAN_COLUMNS if c != "primaryid"]
+    set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+
+    with raw_conn.cursor() as cur:
+        cur.execute("""
+            CREATE TEMP TABLE _stage_demo_clean
+            (LIKE faers.demo_clean INCLUDING DEFAULTS)
+            ON COMMIT DROP
+        """)
+        cur.execute(
+            "ALTER TABLE _stage_demo_clean DROP CONSTRAINT IF EXISTS demo_clean_pkey"
+        )
+
+        with cur.copy(f"COPY _stage_demo_clean ({col_list}) FROM STDIN") as copy:
+            for row in rows:
+                copy.write_row([row.get(c) for c in DEMO_CLEAN_COLUMNS])
+
+        cur.execute(f"""
+            INSERT INTO faers.demo_clean ({col_list})
+            SELECT {col_list} FROM _stage_demo_clean
+            ON CONFLICT (primaryid) DO UPDATE SET {set_clause}
+        """)
+        
 def _copy_rows(
     raw_conn,
     table: str,
@@ -197,3 +248,45 @@ def _copy_rows(
                         v = json.dumps(v)
                     values.append(v)
                 copy.write_row(values)
+
+
+def _dry_run_ingest(csv_path: Path) -> dict[str, Any]:
+    """Validate every row but write nothing. Returns the same shape as a real ingest."""
+    from collections import Counter
+
+    rows_seen = 0
+    rows_clean = 0
+    rows_rejected = 0
+    rejection_reasons: Counter[str] = Counter()
+    annotation_counts: Counter[str] = Counter()
+
+    for _line_no, record in iter_demo_records(csv_path):
+        rows_seen += 1
+        try:
+            validated = DemoRow.model_validate(record)
+            rows_clean += 1
+            if validated.age_group_boundary_mismatch:
+                annotation_counts["age_group_boundary_mismatch"] += 1
+            if validated.event_dt_suspect_imputed:
+                annotation_counts["event_dt_suspect_imputed"] += 1
+        except ValidationError as e:
+            rows_rejected += 1
+            rejection_reasons[summarise(e.errors())] += 1
+
+    log.info(
+        f"Dry run complete: seen={rows_seen}, clean={rows_clean}, rejected={rows_rejected}"
+    )
+    if rejection_reasons:
+        log.info(f"Rejection reasons: {dict(rejection_reasons)}")
+    if annotation_counts:
+        log.info(f"Annotations on clean rows: {dict(annotation_counts)}")
+
+    return {
+        "run_id": None,
+        "rows_seen": rows_seen,
+        "rows_clean": rows_clean,
+        "rows_rejected": rows_rejected,
+        "dry_run": True,
+        "rejection_reasons": dict(rejection_reasons),
+        "annotations": dict(annotation_counts),
+    }                
